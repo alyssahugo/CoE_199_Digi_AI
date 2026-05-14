@@ -101,11 +101,13 @@ module DMA_Controller #(
         // AXI IDs: single master, all in-order, tied to zero
         // MIG requires these even without out-of-order transactions
         output wire [3:0]  M_AXI_ARID,
-        output wire [3:0]  M_AXI_AWID
+        output wire [3:0]  M_AXI_AWID,
+        input  wire [3:0]  M_AXI_RID,   // returned by MIG, not used
+        input  wire [3:0]  M_AXI_BID,   // returned by MIG, not used
 
-        // DDR calibration done — do not fire any transfer until HIGH
+        // DDR calibration done - do not fire any transfer until HIGH
         // Connect to MIG init_calib_complete (~100us after reset)
-        //input  wire        i_ddr_calib_done
+        input  wire        i_ddr_calib_done
     );
         // Constants 
         localparam BPB  = DATA_WIDTH / 8;           // bytes per beat = 8
@@ -136,6 +138,8 @@ module DMA_Controller #(
         // ---------------------------------------------------------------------------
         reg [15:0] aw_lat;
         reg        aw_pend;
+        reg [NUM_CHANNEL-1:0] start_toggle;
+        reg [NUM_CHANNEL-1:0] status_clear_toggle;
          
         always @(posedge clk or negedge nrst) begin : p_axil_wr
             integer i;
@@ -143,6 +147,8 @@ module DMA_Controller #(
                 s_axil_awready <= 0; s_axil_wready <= 0;
                 s_axil_bvalid  <= 0; s_axil_bresp  <= 0;
                 aw_pend <= 0; aw_lat <= 0;
+                start_toggle <= 0;
+                status_clear_toggle <= 0;
                 for (i = 0; i < NUM_CHANNEL; i = i + 1) begin
                     cfg_src[i] <= 0; cfg_dst[i] <= 0;
                     cfg_len[i] <= 0; cfg_ctrl[i] <= 0;
@@ -171,8 +177,39 @@ module DMA_Controller #(
                             R_SRC:    cfg_src[ch]    <= s_axil_wdata;
                             R_DST:    cfg_dst[ch]    <= s_axil_wdata;
                             R_LEN:    cfg_len[ch]    <= s_axil_wdata;
-                            R_CTRL:   cfg_ctrl[ch]     <= s_axil_wdata;
-                            R_STATUS: reg_status[ch]   <= reg_status[ch] & ~s_axil_wdata; // W1C
+                            R_CTRL: begin
+                            // Auto-clear. Makes sure CR is not stuck at 1
+                                cfg_ctrl[ch] <= 32'h0;
+                                // Redirect the cfg_ctrl writing to only the Main FSM. 
+                                // Avoids Synthesis errors.
+                                /* Do a toggle instead of storing START as a sticky cfg_ctrl bit.
+                                When the CPU writes CTRL.START=1 for a channel, start_toggle[ch] flips.
+                                The main FSM checks if start_toggle changed compared to start_seen_toggle.
+                                If it changed, the FSM treats that as a new DMA start command. */
+                                if (s_axil_wdata[0]) begin
+                                    case (ch)
+                                        2'd0: start_toggle[0] <= ~start_toggle[0];
+                                        2'd1: start_toggle[1] <= ~start_toggle[1];
+                                        2'd2: start_toggle[2] <= ~start_toggle[2];
+                                        2'd3: start_toggle[3] <= ~start_toggle[3];
+                                        default: ;
+                                    endcase
+                                end
+                            end
+                            R_STATUS: begin
+                            /* Same idea for clearing DONE.
+                            When the CPU writes STATUS.DONE=1, status_clear_toggle[ch] flips.
+                            The FSM notices the flip and clears the DONE bit itself. */
+                                if (s_axil_wdata[1]) begin
+                                    case (ch)
+                                        2'd0: status_clear_toggle[0] <= ~status_clear_toggle[0];
+                                        2'd1: status_clear_toggle[1] <= ~status_clear_toggle[1];
+                                        2'd2: status_clear_toggle[2] <= ~status_clear_toggle[2];
+                                        2'd3: status_clear_toggle[3] <= ~status_clear_toggle[3];
+                                        default: ;
+                                    endcase
+                                end
+                            end
                             R_SPAD:   cfg_spad_sel[ch] <= s_axil_wdata[2:0]; // 3 bits only
                             default: ;
                         endcase
@@ -228,6 +265,8 @@ module DMA_Controller #(
         // pending is declared inside p_master; we need a wire for the arbiter
         // Use a generate-time combinational assign outside the always block.
         reg  [NUM_CHANNEL-1:0] pending;        // declared here, written only by p_master
+        reg  [NUM_CHANNEL-1:0] start_seen_toggle;
+        reg  [NUM_CHANNEL-1:0] status_clear_seen_toggle;
         wire arb_valid = |pending;
         wire [1:0] arb_ch = pending[0] ? 2'd0 :
                             pending[1] ? 2'd1 :
@@ -257,7 +296,7 @@ module DMA_Controller #(
             if (!nrst) begin
                 mst <= S_IDLE; m_ch <= 0; m_blen <= 0; m_bytes <= 0;
                 fw <= 0; fr <= 0;
-                pending <= 0; //interrupt_req <= 0;
+                pending <= 0; start_seen_toggle <= 0; status_clear_seen_toggle <= 0; //interrupt_req <= 0;
                 for (i = 0; i < NUM_CHANNEL; i = i + 1) begin
                     w_src[i] <= 0; w_dst[i] <= 0; w_rem[i] <= 0; w_spad_sel[i] <= 3'b000;
                     reg_status[i] <= 0;
@@ -275,18 +314,22 @@ module DMA_Controller #(
                 // ---- Start-bit detector: runs every cycle, for all channels ----
                 // Only accepts a new request if channel is not already pending/active
                 for (i = 0; i < NUM_CHANNEL; i = i + 1) begin
+                    if (status_clear_toggle[i] != status_clear_seen_toggle[i]) begin
+                        reg_status[i] <= reg_status[i] & ~32'h2;
+                        status_clear_seen_toggle[i] <= status_clear_toggle[i];
+                    end
+
                     // Guard: do not snapshot until DDR is ready
                     // Without this the DMA hangs in S_RADDR forever
                     // if fired before MIG init_calib_complete goes high
-                    if (cfg_ctrl[i][0] && !pending[i] &&
-                        !(mst != S_IDLE && m_ch == i[1:0])) begin
+                    if ((start_toggle[i] != start_seen_toggle[i]) && !pending[i] &&
+                        !(mst != S_IDLE && m_ch == i[1:0]) && i_ddr_calib_done) begin
                         w_src[i]      <= cfg_src[i];
                         w_dst[i]      <= cfg_dst[i];
                         w_rem[i]      <= cfg_len[i];
                         w_spad_sel[i] <= cfg_spad_sel[i]; // snapshot spad target
                         reg_status[i] <= 32'h1;         // BUSY
-                        // Clear the START bit so we don't re-trigger
-                        cfg_ctrl[i][0] <= 0;
+                        start_seen_toggle[i] <= start_toggle[i];
                         pending[i]     <= 1;
                     end
                 end
@@ -391,6 +434,7 @@ module DMA_Controller #(
                 endcase
             end
         end
+
 // M_SPAD_SEL is valid whenever the master FSM is in S_WDATA
 // top.sv uses this to route i_write_en to the correct SPAD
 assign M_SPAD_SEL = w_spad_sel[m_ch];
