@@ -1,0 +1,622 @@
+////-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+//// sf_controller.v -- Stall + flush + forwarding controller module
+////-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+//// Author: Microlab 198 Pipelined RISC-V Group (2SAY1920)
+////-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+////
+////-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+//// Module Name: sf_controller.v
+//// Description:
+//// 				A handy excuse to merge controlling for stalls and flushes (bad for performance), 
+//// 				and clock gating (good for power usage).
+//// 				This controller now also includes the forwarding unit controller in order to reduce the number of wire declarations in the core module.
+//// 				Stalls and flushes are handled using a mix of clock gating, and additional support logic that facilitates stalling or flushing in the
+//// 				corresponding pipeline registers.
+//// 				The scenarios currently supported by the gating logic are as follows:
+//// 					- Stalls
+//// 						All stalls are handled by disabling the clock for the corresponding stage.
+//// 						e.g. an ID-stage stall will have the ID stage clock disabled.
+//// 					- Flushes
+//// 						A flush will result in a case-by-case resolution of what will happen. Be prepared for inconsistent behavior.
+//// 						To give two examples:
+//// 							- A MEM-stage flush due to a data hazard will result in the MEM stage clock getting disabled on the current
+//// 							  WB stage clock getting disabled on the next cycle, and will force a non-flush on the next cycle.
+//// 							- The ISR flushes (ISR_PC_flush and ISR_pipe_flush) work together, but act differently.
+//// 							  Only the ISR_pipe_flush signal can actually disable the IF- and ID-stage clocks.
+//// 						What *is* consistent, however, is that flushes get propagated to later stages via the *_prev_flush registers,
+//// 						with the exception of the IF-stage. 
+//// 					- Looping Jumps
+//// 						A looping jump is defined as a jump whose target address is the same as its own address.
+//// 						Such jumps are detected by checking if the ID-stage instruction is a jump, and if the IF- and ID-stage PC
+//// 						addresses are equal. If both conditions are met, the result is to disable the IF- and ID-stage clocks, and
+//// 						to the EXE stage.
+//// 						Due to how the interrupt memory space is currently implemented, looping jumps cannot be escaped from without resetting.
+//// 						As such, please use branches to wait for interrupts instead.
+//// 					- NOPs
+//// 						These are treated as EXE-stage flushes, but the implementation disables the EXE-stage clock as well. 
+////
+//// Revisions:
+//// Revision 0.01 - File Created
+//// Additional Comments:
+//// 
+////-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+
+//`include "constants.vh"
+//`timescale 1ns / 1ps
+
+//module sf_controller(
+//    // Uncomment the ff. if needed
+//    input clk,
+//    input nrst,
+
+//    // IF stage
+//    input [`PC_ADDR_BITS-1:0] if_pc,
+//	input [`PC_ADDR_BITS-1:0] if_pcnew,
+//    input if_ready,
+
+//    // ID stage inputs
+//	input [`PC_ADDR_BITS-1:0] id_pc,
+//    input is_jump,				// uses controller1 to find if jump or not
+//    input is_nop,				// ID Stage NOP
+    
+//    input ISR_PC_flush,			// Output flush signals of interrupt controller
+//    input ISR_pipe_flush,
+
+//    input branch_flush,			// Output flush signals from BHT
+//    input jump_flush,
+
+//    input mem_active_op,        // A signal from the MEM stage that its undergoing a memory operation
+//    input mul_stall,            // Stall due to multiplication
+//    input div_running,			// Status of Divider unit
+    
+//    input dmem_stall,           // Stall in datamem unit 
+//    input dmem_ready,           // Datamem load output ready
+
+//    // Stalls/Enables
+//	output if_stall,			// controls PC + instmem stall
+//	output id_stall,			// controls IF/ID pipeline register stall
+//	output exe_stall,
+//	output mem_stall,
+
+//	// Flushes/Resets (flushes act as active-high resets)
+//	output if_flush,			// controls PC flush
+//	output id_flush,			// controls IF/ID pipeline register flush
+//	output exe_flush,			// controls ID/EXE pipeline register flush
+//	output mem_flush,			// controls EXE/MEM pipeline register flush
+//	output wb_flush, 			// controls MEM/WB pipeline register flush
+
+//    // Clock Enables
+//    output if_clk_en,
+//    output id_clk_en,
+//    output exe_clk_en,
+//    output mem_clk_en,
+//    output wb_clk_en,
+//    output rf_clk_en,
+
+//    // Forwarding Unit Inputs
+//    // Source registers
+//	input [`REGFILE_BITS-1:0] id_rsA,
+//	input [`REGFILE_BITS-1:0] id_rsB,
+//	input [`REGFILE_BITS-1:0] exe_rsA,
+//	input [`REGFILE_BITS-1:0] exe_rsB,
+
+//	// Destination registers
+//	input [`REGFILE_BITS-1:0] exe_rd,
+//	input [`REGFILE_BITS-1:0] mem_rd,
+//	input [`REGFILE_BITS-1:0] wb_rd,
+
+//	// Control signals
+//	input exe_wr_en,
+//	input mem_wr_en,
+//	input wb_wr_en,
+
+//	input id_sel_opA,
+//	input id_sel_opB,
+
+//	input [2:0] id_sel_data,
+//	input [2:0] exe_sel_data,
+//	input [2:0] mem_sel_data,
+//	input [2:0] wb_sel_data,
+
+//	input id_is_stype,
+//	input id_is_btype,
+
+//	input [2:0] id_imm_select,
+
+//	input [6:0] exe_opcode,
+//	input exe_comp_use_A,
+//	input exe_comp_use_B,
+//	input exe_is_comp,
+//	input id_sel_opBR,             // jalr in ID stage 
+//	input exe_sel_opBR,            // jalr in EXE stage
+
+//	// Outputs
+//	// Forwarding to ID stage
+//	output fw_exe_to_id_A,
+//	output fw_exe_to_id_B,
+//	output fw_mem_to_id_A,
+//	output fw_mem_to_id_B,
+//	output fw_wb_to_id_A,
+//	output fw_wb_to_id_B,
+
+//	// Forwarding to EXE stage
+//	output fw_wb_to_exe_A,
+//	output fw_wb_to_exe_B,
+//	output fw_mem_to_exe_B,
+//    output load_hazard          // result of having a L[W/H/B] -> EXE hazard
+//);
+
+// 	// Forwarding to ID stage
+//	wire t_fw_exe_to_id_A;
+//	wire t_fw_exe_to_id_B;
+//	wire t_fw_mem_to_id_A;
+//	wire t_fw_mem_to_id_B;
+//	wire t_fw_wb_to_id_A;
+//	wire t_fw_wb_to_id_B;
+
+//	// Forwarding to EXE stage
+//	wire t_fw_wb_to_exe_A;
+//	wire t_fw_wb_to_exe_B;
+
+//	// Data (Forwarding) Read-After-Write Hazards
+//    wire hzd_exe_to_id_A;
+//    wire hzd_mem_to_id_A;
+//    wire hzd_mem_to_exe_A;
+//    wire hzd_mem_to_exe_B;
+
+//    forwarding_unit FWD(
+//		// Source registers
+//		.id_rsA(id_rsA),
+//		.id_rsB(id_rsB),
+//		.exe_rsA(exe_rsA),
+//		.exe_rsB(exe_rsB),
+
+//		// Destination registers
+//		.exe_rd(exe_rd),
+//		.mem_rd(mem_rd),
+//		.wb_rd(wb_rd),
+
+//		// Control signals
+//		.exe_wr_en(exe_wr_en),
+//		.mem_wr_en(mem_wr_en),
+//		.wb_wr_en(wb_wr_en),
+
+//		.id_sel_opA(id_sel_opA),
+//		.id_sel_opB(id_sel_opB),
+
+//		.id_sel_data(id_sel_data),
+//		.exe_sel_data(exe_sel_data),
+//		.mem_sel_data(mem_sel_data),
+//		.wb_sel_data(wb_sel_data),
+
+//		.id_is_stype(id_is_stype),
+//		.id_is_btype(id_is_btype),
+
+//		.id_imm_select(id_imm_select),
+
+//		.exe_opcode(exe_opcode),
+//		.exe_comp_use_A(exe_comp_use_A),
+//		.exe_comp_use_B(exe_comp_use_B),
+//		.exe_is_comp(exe_is_comp),
+//		.id_sel_opBR(id_sel_opBR),
+
+//		// Outputs
+//		.fw_exe_to_id_A(t_fw_exe_to_id_A),
+//		.fw_exe_to_id_B(t_fw_exe_to_id_B),
+//		.fw_mem_to_id_A(t_fw_mem_to_id_A),
+//		.fw_mem_to_id_B(t_fw_mem_to_id_B),
+//		.fw_wb_to_id_A(t_fw_wb_to_id_A),
+//		.fw_wb_to_id_B(t_fw_wb_to_id_B),
+
+//		.fw_wb_to_exe_A(t_fw_wb_to_exe_A),
+//		.fw_wb_to_exe_B(t_fw_wb_to_exe_B),
+
+//		.hzd_exe_to_id_A(hzd_exe_to_id_A),
+//		.hzd_exe_to_id_B(hzd_exe_to_id_B),
+//		.hzd_mem_to_id_A(hzd_mem_to_id_A),
+//		.hzd_mem_to_exe_A(hzd_mem_to_exe_A),
+//		.hzd_mem_to_exe_B(hzd_mem_to_exe_B)
+//	);
+
+//	/* 
+	
+//		*_prev_flush registers keep track of whether the current stage has contains an instruction that has been flushed.
+		
+//		For example:
+//		- id_prev_flush tracks whether an instruction was flushed from the ID stage on the previous cycle.
+//		  Thus, it corresponds to the EXE stage on the current cycle.
+
+//	*/
+//	reg id_prev_flush;
+//	reg exe_prev_flush;
+//	reg mem_prev_flush;
+//    reg wb_prev_flush;
+//    reg mem_hold;
+
+//    // results of forwarding
+//    assign fw_exe_to_id_A = t_fw_exe_to_id_A;
+//    assign fw_exe_to_id_B = t_fw_exe_to_id_B;
+//    assign fw_mem_to_id_A = t_fw_mem_to_id_A;
+//    assign fw_mem_to_id_B = t_fw_mem_to_id_B;
+//    assign fw_wb_to_id_A = t_fw_wb_to_id_A;
+//    assign fw_wb_to_id_B = t_fw_wb_to_id_B;
+
+//    assign fw_wb_to_exe_A = t_fw_wb_to_exe_A && !wb_prev_flush;
+//    assign fw_wb_to_exe_B = t_fw_wb_to_exe_B && !wb_prev_flush;
+
+//    wire loop_jump = (if_pc == if_pcnew) && (if_pc == id_pc) && is_jump && ~id_sel_opBR && ~id_stall && ~exe_flush;
+    
+//    wire exe_jalr_hazard = hzd_exe_to_id_A || hzd_exe_to_id_B;											// LOAD -> JALR (EXE stage) will result in a one-cycle stall for IF and ID stages
+//																					// Branches are also affected now, so introduce a stall for them too
+//																					// Provisional fix: all exe->id hazards from load instructions cause a delay here to prevent load_hazard
+//																					// from breaking forwarding logic
+
+//    wire mem_jalr_hazard = hzd_mem_to_id_A;                         				// LOAD -> JALR (MEM stage) will result in a one-cycle stall for IF,ID, and EXE stages
+//																					// Load -> Load instructions also break, so stall for them too
+//    assign load_hazard = hzd_mem_to_exe_A || (hzd_mem_to_exe_B && ~(exe_opcode == `OPC_STYPE));                	// LOAD -> Other instruction
+//																					// Explicit load hazards removed for load->store sequences
+//	assign fw_mem_to_exe_B = hzd_mem_to_exe_B;
+    
+//    /* 
+//        Load hazard: wait until load instruction leaves MEM stage
+//    */
+    
+//    // Stalls/Enables
+//    assign if_stall = (load_hazard || exe_jalr_hazard || mem_jalr_hazard || div_running ||( mul_stall && !mem_active_op) ||(dmem_stall && ~dmem_ready)) || /*mem_hold ||*/ ((exe_opcode == `OPC_STYPE) && dmem_stall && dmem_ready) || dmem_stall;
+//    assign id_stall = (load_hazard || exe_jalr_hazard || mem_jalr_hazard || div_running || ( mul_stall && !mem_active_op) || (dmem_stall && ~dmem_ready)) || /*mem_hold ||*/ ((exe_opcode == `OPC_STYPE) && dmem_stall && dmem_ready)|| dmem_stall;
+//    assign exe_stall = (load_hazard || (mem_jalr_hazard  && ~dmem_ready) || div_running || ( mul_stall && !mem_active_op) || (dmem_stall && ~dmem_ready)) || /*mem_hold ||*/ ((exe_opcode == `OPC_STYPE) && dmem_stall && dmem_ready)|| dmem_stall;
+//    assign mem_stall = ( ( load_hazard  || dmem_stall) && ~dmem_ready) || mem_hold;					
+
+//    // Flushes/Resets
+    
+//    assign if_flush = ISR_PC_flush;
+//    assign id_flush = (ISR_pipe_flush || jump_flush || branch_flush) || (!if_ready && !id_stall);
+////    assign exe_flush = exe_jalr_hazard || branch_flush || (is_nop && ~mem_stall);
+//    assign exe_flush = branch_flush || (is_nop && ~mem_stall);
+//    assign mem_flush = ( (div_running || mul_stall) && !mem_active_op) || (load_hazard && dmem_ready) || ((exe_opcode == `OPC_STYPE) && dmem_ready);	
+//    assign wb_flush = mem_stall;
+
+//    // Enables
+//	reg prev_nrst;
+//    wire shut_down = (prev_nrst && ~nrst);
+
+//    assign if_clk_en = shut_down || (~(if_stall || (loop_jump && ~ISR_pipe_flush)) && nrst);
+//    assign id_clk_en = shut_down || (~(id_stall || (loop_jump && ~ISR_pipe_flush)) && nrst);
+//    assign exe_clk_en = shut_down || (~(exe_stall || (id_prev_flush && ~exe_flush) || (is_nop && ~exe_flush)) && nrst);
+//    assign mem_clk_en = shut_down || (~(mem_stall || mem_flush || (exe_prev_flush && ~mem_jalr_hazard)) && nrst);
+//    assign wb_clk_en = shut_down || (~mem_prev_flush && nrst);
+//    assign rf_clk_en = shut_down ||  (~wb_prev_flush && wb_wr_en && nrst);
+
+//    always@(posedge clk) begin
+//        if (!nrst) begin
+//			prev_nrst <= 1'b0;
+//            id_prev_flush <= 1'b0;
+//            exe_prev_flush <= 1'b0;
+//            mem_prev_flush <= 1'b0;
+//            wb_prev_flush <= 1'b0;
+//            mem_hold <= 1'b0;
+//        end
+//        else begin
+//			prev_nrst <= 1'b1;
+//            id_prev_flush <= ((id_flush || loop_jump) && ~ISR_pipe_flush);
+//            exe_prev_flush <= (id_prev_flush ? id_prev_flush : exe_flush);
+//            if (mem_stall)
+//                mem_prev_flush <= (exe_prev_flush ? exe_prev_flush : 1'b0);
+//            else
+//                mem_prev_flush <= (exe_prev_flush ? exe_prev_flush : mem_flush);
+//            wb_prev_flush <= (mem_prev_flush ? mem_prev_flush : wb_flush);
+//            mem_hold <= (dmem_stall && dmem_ready);
+//        end
+//    end
+    
+
+//endmodule
+//-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+// sf_controller.v -- Stall + flush + forwarding controller module
+//-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+// Author: Microlab 198 Pipelined RISC-V Group (2SAY1920)
+//-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+//
+//-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+// Module Name: sf_controller.v
+// Description:
+// 				A handy excuse to merge controlling for stalls and flushes (bad for performance), 
+// 				and clock gating (good for power usage).
+// 				This controller now also includes the forwarding unit controller in order to reduce the number of wire declarations in the core module.
+// 				Stalls and flushes are handled using a mix of clock gating, and additional support logic that facilitates stalling or flushing in the
+// 				corresponding pipeline registers.
+// 				The scenarios currently supported by the gating logic are as follows:
+// 					- Stalls
+// 						All stalls are handled by disabling the clock for the corresponding stage.
+// 						e.g. an ID-stage stall will have the ID stage clock disabled.
+// 					- Flushes
+// 						A flush will result in a case-by-case resolution of what will happen. Be prepared for inconsistent behavior.
+// 						To give two examples:
+// 							- A MEM-stage flush due to a data hazard will result in the MEM stage clock getting disabled on the current
+// 							  WB stage clock getting disabled on the next cycle, and will force a non-flush on the next cycle.
+// 							- The ISR flushes (ISR_PC_flush and ISR_pipe_flush) work together, but act differently.
+// 							  Only the ISR_pipe_flush signal can actually disable the IF- and ID-stage clocks.
+// 						What *is* consistent, however, is that flushes get propagated to later stages via the *_prev_flush registers,
+// 						with the exception of the IF-stage. 
+// 					- Looping Jumps
+// 						A looping jump is defined as a jump whose target address is the same as its own address.
+// 						Such jumps are detected by checking if the ID-stage instruction is a jump, and if the IF- and ID-stage PC
+// 						addresses are equal. If both conditions are met, the result is to disable the IF- and ID-stage clocks, and
+// 						to the EXE stage.
+// 						Due to how the interrupt memory space is currently implemented, looping jumps cannot be escaped from without resetting.
+// 						As such, please use branches to wait for interrupts instead.
+// 					- NOPs
+// 						These are treated as EXE-stage flushes, but the implementation disables the EXE-stage clock as well. 
+//
+// Revisions:
+// Revision 0.01 - File Created
+// Additional Comments:
+// 
+//-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+
+`include "constants.vh"
+`timescale 1ns / 1ps
+
+module sf_controller(
+    // Uncomment the ff. if needed
+    input clk,
+    input nrst,
+
+    // IF stage
+    input [`PC_ADDR_BITS-1:0] if_pc,
+	input [`PC_ADDR_BITS-1:0] if_pcnew,
+    input if_ready,
+
+    // ID stage inputs
+	input [`PC_ADDR_BITS-1:0] id_pc,
+    input is_jump,				// uses controller1 to find if jump or not
+    input is_nop,				// ID Stage NOP
+    
+    input ISR_PC_flush,			// Output flush signals of interrupt controller
+    input ISR_pipe_flush,
+
+    input branch_flush,			// Output flush signals from BHT
+    input jump_flush,
+    input mem_active_op,        // A signal from the MEM stage that its undergoing a memory operation
+
+    input mul_stall,            // Stall due to multiplication
+    input div_running,			// Status of Divider unit
+    
+    input dmem_stall,           // Stall in datamem unit 
+    input dmem_ready,           // Datamem load output ready
+
+    // Stalls/Enables
+	output if_stall,			// controls PC + instmem stall
+	output id_stall,			// controls IF/ID pipeline register stall
+	output exe_stall,
+	output mem_stall,
+
+	// Flushes/Resets (flushes act as active-high resets)
+	output if_flush,			// controls PC flush
+	output id_flush,			// controls IF/ID pipeline register flush
+	output exe_flush,			// controls ID/EXE pipeline register flush
+	output mem_flush,			// controls EXE/MEM pipeline register flush
+	output wb_flush, 			// controls MEM/WB pipeline register flush
+
+    // Clock Enables
+    output if_clk_en,
+    output id_clk_en,
+    output exe_clk_en,
+    output mem_clk_en,
+    output wb_clk_en,
+    output rf_clk_en,
+
+    // Forwarding Unit Inputs
+    // Source registers
+	input [`REGFILE_BITS-1:0] id_rsA,
+	input [`REGFILE_BITS-1:0] id_rsB,
+	input [`REGFILE_BITS-1:0] exe_rsA,
+	input [`REGFILE_BITS-1:0] exe_rsB,
+
+	// Destination registers
+	input [`REGFILE_BITS-1:0] exe_rd,
+	input [`REGFILE_BITS-1:0] mem_rd,
+	input [`REGFILE_BITS-1:0] wb_rd,
+
+	// Control signals
+	input exe_wr_en,
+	input mem_wr_en,
+	input wb_wr_en,
+
+	input id_sel_opA,
+	input id_sel_opB,
+
+	input [2:0] id_sel_data,
+	input [2:0] exe_sel_data,
+	input [2:0] mem_sel_data,
+	input [2:0] wb_sel_data,
+
+	input id_is_stype,
+	input id_is_btype,
+
+	input [2:0] id_imm_select,
+
+	input [6:0] exe_opcode,
+	input exe_comp_use_A,
+	input exe_comp_use_B,
+	input exe_is_comp,
+	input id_sel_opBR,             // jalr in ID stage 
+	input exe_sel_opBR,            // jalr in EXE stage
+
+	// Outputs
+	// Forwarding to ID stage
+	output fw_exe_to_id_A,
+	output fw_exe_to_id_B,
+	output fw_mem_to_id_A,
+	output fw_mem_to_id_B,
+	output fw_wb_to_id_A,
+	output fw_wb_to_id_B,
+
+	// Forwarding to EXE stage
+	output fw_wb_to_exe_A,
+	output fw_wb_to_exe_B,
+	output fw_mem_to_exe_B,
+    output load_hazard          // result of having a L[W/H/B] -> EXE hazard
+);
+
+ 	// Forwarding to ID stage
+	wire t_fw_exe_to_id_A;
+	wire t_fw_exe_to_id_B;
+	wire t_fw_mem_to_id_A;
+	wire t_fw_mem_to_id_B;
+	wire t_fw_wb_to_id_A;
+	wire t_fw_wb_to_id_B;
+
+	// Forwarding to EXE stage
+	wire t_fw_wb_to_exe_A;
+	wire t_fw_wb_to_exe_B;
+
+	// Data (Forwarding) Read-After-Write Hazards
+    wire hzd_exe_to_id_A;
+    wire hzd_mem_to_id_A;
+    wire hzd_mem_to_exe_A;
+    wire hzd_mem_to_exe_B;
+
+    forwarding_unit FWD(
+		// Source registers
+		.id_rsA(id_rsA),
+		.id_rsB(id_rsB),
+		.exe_rsA(exe_rsA),
+		.exe_rsB(exe_rsB),
+
+		// Destination registers
+		.exe_rd(exe_rd),
+		.mem_rd(mem_rd),
+		.wb_rd(wb_rd),
+
+		// Control signals
+		.exe_wr_en(exe_wr_en),
+		.mem_wr_en(mem_wr_en),
+		.wb_wr_en(wb_wr_en),
+
+		.id_sel_opA(id_sel_opA),
+		.id_sel_opB(id_sel_opB),
+
+		.id_sel_data(id_sel_data),
+		.exe_sel_data(exe_sel_data),
+		.mem_sel_data(mem_sel_data),
+		.wb_sel_data(wb_sel_data),
+
+		.id_is_stype(id_is_stype),
+		.id_is_btype(id_is_btype),
+
+		.id_imm_select(id_imm_select),
+
+		.exe_opcode(exe_opcode),
+		.exe_comp_use_A(exe_comp_use_A),
+		.exe_comp_use_B(exe_comp_use_B),
+		.exe_is_comp(exe_is_comp),
+		.id_sel_opBR(id_sel_opBR),
+
+		// Outputs
+		.fw_exe_to_id_A(t_fw_exe_to_id_A),
+		.fw_exe_to_id_B(t_fw_exe_to_id_B),
+		.fw_mem_to_id_A(t_fw_mem_to_id_A),
+		.fw_mem_to_id_B(t_fw_mem_to_id_B),
+		.fw_wb_to_id_A(t_fw_wb_to_id_A),
+		.fw_wb_to_id_B(t_fw_wb_to_id_B),
+
+		.fw_wb_to_exe_A(t_fw_wb_to_exe_A),
+		.fw_wb_to_exe_B(t_fw_wb_to_exe_B),
+
+		.hzd_exe_to_id_A(hzd_exe_to_id_A),
+		.hzd_exe_to_id_B(hzd_exe_to_id_B),
+		.hzd_mem_to_id_A(hzd_mem_to_id_A),
+		.hzd_mem_to_exe_A(hzd_mem_to_exe_A),
+		.hzd_mem_to_exe_B(hzd_mem_to_exe_B)
+	);
+
+	/* 
+	
+		*_prev_flush registers keep track of whether the current stage has contains an instruction that has been flushed.
+		
+		For example:
+		- id_prev_flush tracks whether an instruction was flushed from the ID stage on the previous cycle.
+		  Thus, it corresponds to the EXE stage on the current cycle.
+
+	*/
+	reg id_prev_flush;
+	reg exe_prev_flush;
+	reg mem_prev_flush;
+    reg wb_prev_flush;
+    reg mem_hold;
+
+    // results of forwarding
+    assign fw_exe_to_id_A = t_fw_exe_to_id_A;
+    assign fw_exe_to_id_B = t_fw_exe_to_id_B;
+    assign fw_mem_to_id_A = t_fw_mem_to_id_A;
+    assign fw_mem_to_id_B = t_fw_mem_to_id_B;
+    assign fw_wb_to_id_A = t_fw_wb_to_id_A;
+    assign fw_wb_to_id_B = t_fw_wb_to_id_B;
+
+    assign fw_wb_to_exe_A = t_fw_wb_to_exe_A && !wb_prev_flush;
+    assign fw_wb_to_exe_B = t_fw_wb_to_exe_B && !wb_prev_flush;
+
+    wire loop_jump = (if_pc == if_pcnew) && (if_pc == id_pc) && is_jump && ~id_sel_opBR && ~id_stall && ~exe_flush;
+    
+    wire exe_jalr_hazard = hzd_exe_to_id_A || hzd_exe_to_id_B;											// LOAD -> JALR (EXE stage) will result in a one-cycle stall for IF and ID stages
+																					// Branches are also affected now, so introduce a stall for them too
+																					// Provisional fix: all exe->id hazards from load instructions cause a delay here to prevent load_hazard
+																					// from breaking forwarding logic
+
+    wire mem_jalr_hazard = hzd_mem_to_id_A;                         				// LOAD -> JALR (MEM stage) will result in a one-cycle stall for IF,ID, and EXE stages
+																					// Load -> Load instructions also break, so stall for them too
+    assign load_hazard = hzd_mem_to_exe_A || (hzd_mem_to_exe_B && ~(exe_opcode == `OPC_STYPE));                	// LOAD -> Other instruction
+																					// Explicit load hazards removed for load->store sequences
+	assign fw_mem_to_exe_B = hzd_mem_to_exe_B;
+    
+    /* 
+        Load hazard: wait until load instruction leaves MEM stage
+    */
+    
+    // Stalls/Enables
+    assign if_stall = (load_hazard || exe_jalr_hazard || mem_jalr_hazard || div_running || mul_stall || (dmem_stall && ~dmem_ready)) || mem_hold || ((exe_opcode == `OPC_STYPE) && dmem_stall && dmem_ready);
+    assign id_stall = (load_hazard || exe_jalr_hazard || mem_jalr_hazard || div_running || mul_stall || (dmem_stall && ~dmem_ready)) || mem_hold || ((exe_opcode == `OPC_STYPE) && dmem_stall && dmem_ready);
+    assign exe_stall = (load_hazard || (exe_jalr_hazard && mem_stall) || (mem_jalr_hazard && ~dmem_ready) || div_running || mul_stall || (dmem_stall && ~dmem_ready)) || mem_hold || ((exe_opcode == `OPC_STYPE) && dmem_stall && dmem_ready);
+    assign mem_stall = ((load_hazard || dmem_stall) && ~dmem_ready) || mem_hold;					
+
+    // Flushes/Resets
+    assign if_flush = ISR_PC_flush;
+    assign id_flush = (ISR_pipe_flush || jump_flush || branch_flush) || (!if_ready && !id_stall);
+    assign exe_flush = (exe_jalr_hazard && ~mem_stall) || branch_flush || (is_nop && ~mem_stall);
+    assign mem_flush = (div_running || mul_stall) || (load_hazard && dmem_ready) || ((exe_opcode == `OPC_STYPE) && dmem_ready);	
+    assign wb_flush = mem_stall;
+
+    // Enables
+	reg prev_nrst;
+    wire shut_down = (prev_nrst && ~nrst);
+
+    assign if_clk_en = shut_down || (~(if_stall || (loop_jump && ~ISR_pipe_flush)) && nrst);
+    assign id_clk_en = shut_down || (~(id_stall || (loop_jump && ~ISR_pipe_flush)) && nrst);
+    assign exe_clk_en = shut_down || (~(exe_stall || (id_prev_flush && ~exe_flush) || (is_nop && ~exe_flush)) && nrst);
+    assign mem_clk_en = shut_down || (~(mem_stall || mem_flush || (exe_prev_flush && ~mem_jalr_hazard)) && nrst);
+    assign wb_clk_en = shut_down || (~mem_prev_flush && nrst);
+    assign rf_clk_en = shut_down ||  (~wb_prev_flush && wb_wr_en && nrst);
+
+    always@(posedge clk) begin
+        if (!nrst) begin
+			prev_nrst <= 1'b0;
+            id_prev_flush <= 1'b0;
+            exe_prev_flush <= 1'b0;
+            mem_prev_flush <= 1'b0;
+            wb_prev_flush <= 1'b0;
+            mem_hold <= 1'b0;
+        end
+        else begin
+			prev_nrst <= 1'b1;
+            id_prev_flush <= ((id_flush || loop_jump) && ~ISR_pipe_flush);
+            exe_prev_flush <= (id_prev_flush ? id_prev_flush : exe_flush);
+            if (mem_stall)
+                mem_prev_flush <= (exe_prev_flush ? exe_prev_flush : 1'b0);
+            else
+                mem_prev_flush <= (exe_prev_flush ? exe_prev_flush : mem_flush);
+            wb_prev_flush <= (mem_prev_flush ? mem_prev_flush : wb_flush);
+            mem_hold <= (dmem_stall && dmem_ready);
+        end
+    end
+endmodule

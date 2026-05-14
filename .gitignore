@@ -1,0 +1,30 @@
+# Vivado generated folders/files
+*.jou
+*.log
+*.str
+*.dcp
+*.bit
+*.ltx
+*.rpt
+*.wdb
+*.runs/
+*.cache/
+*.hw/
+*.ip_user_files/
+*.sim/
+*.gen/
+*.Xil/
+
+# Generated memory/build files
+*.bin
+*.mem
+*.coe
+
+# TFLM/build outputs
+build/
+gen/
+
+# Windows/WSL junk
+*.Zone.Identifier
+Thumbs.db
+.DS_Store
