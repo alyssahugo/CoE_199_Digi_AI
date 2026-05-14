@@ -26,9 +26,9 @@ Download the following folders/files before creating the Vivado project:
 2. Create a new project.
 3. Click **Next** until you reach the **Boards** tab.
 4. Select **Nexys Video**.
-5. Open `project_run.tcl` in Notepad or another text editor.
-6. Change the source directory to the location of your downloaded `second_import_files` folder.
-7. In Vivado, go to **Tools > Run Tcl Script**, then select `project_run.tcl`.
+5. Open `import_project.tcl` in Notepad or another text editor.
+6. Change the source directory to the location of your downloaded `GitHub CoE 199 repo` folder.
+7. In Vivado, go to **Tools > Run Tcl Script**, then select `import_project.tcl`.
 
    Checkpoint: after running the script, there should be around **47 files** in **Design Sources**.
 
@@ -42,13 +42,13 @@ Download the following folders/files before creating the Vivado project:
 
    Then select **Make Active**.
 
-9. Open `uart_bd.tcl`.
+9. Open `CoE_199_Full_System.tcl`.
 10. Search for `datamem_run` and `instmem_run`.
 11. Replace the paths with the local paths to your own `datamem_run.coe` and `instmem_run.coe` files.
 12. In Vivado, go to **Tools > Run Tcl Script**, then run:
 
    ```text
-   uart_bd_with_qspi.tcl
+   CoE_199_Full_System.tcl
    ```
 
    This should build the block design. As long as all required modules are present in the processor folder inside `second_import_files`, the block design should build successfully.
